@@ -1,11 +1,13 @@
 package clickhouse
 
 import (
+	"bufio"
+	"bytes"
 	"database/sql"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/mattes/migrate"
@@ -93,16 +95,99 @@ func (ch *ClickHouse) init() error {
 }
 
 func (ch *ClickHouse) Run(r io.Reader) error {
-	migration, err := ioutil.ReadAll(r)
+	statements, err := getSQLStatements(r)
 	if err != nil {
 		return err
 	}
-	if _, err := ch.conn.Exec(string(migration)); err != nil {
-		return database.Error{OrigErr: err, Err: "migration failed", Query: migration}
+	for _, migration := range statements {
+		if _, err := ch.conn.Exec(migration); err != nil {
+			return database.Error{OrigErr: err, Err: "migration failed", Query: []byte(migration)}
+		}
 	}
-
 	return nil
 }
+
+const sqlCmdPrefix = "-- +migrate "
+
+// Checks the line to see if the line has a statement-ending semicolon
+// or if the line contains a double-dash comment.
+func endsWithSemicolon(line string) bool {
+	prev := ""
+	scanner := bufio.NewScanner(strings.NewReader(line))
+	scanner.Split(bufio.ScanWords)
+
+	for scanner.Scan() {
+		word := scanner.Text()
+		if strings.HasPrefix(word, "--") {
+			break
+		}
+		prev = word
+	}
+
+	return strings.HasSuffix(prev, ";")
+}
+
+// Split the given sql script into individual statements.
+//
+// The base case is to simply split on semicolons, as these
+// naturally terminate a statement.
+//
+// However, more complex cases like pl/pgsql can have semicolons
+// within a statement. For these cases, we provide the explicit annotations
+// 'StatementBegin' and 'StatementEnd' to allow the script to
+// tell us to ignore semicolons.
+func getSQLStatements(r io.Reader) (stmts []string, err error) {
+	var (
+		buf              bytes.Buffer
+		statementEnded   bool
+		ignoreSemicolons bool
+		scanner          = bufio.NewScanner(r)
+	)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, sqlCmdPrefix) {
+			cmd := strings.TrimSpace(line[len(sqlCmdPrefix):])
+			switch cmd {
+			case "StatementBegin":
+				ignoreSemicolons = true
+			case "StatementEnd":
+				statementEnded = (ignoreSemicolons == true)
+				ignoreSemicolons = false
+			}
+			continue
+		}
+
+		if _, err := buf.WriteString(line + "\n"); err != nil {
+			return nil, err
+		}
+
+		// Wrap up the two supported cases: 1) basic with semicolon; 2) psql statement
+		// Lines that end with semicolon that are in a statement block
+		// do not conclude statement.
+		if (!ignoreSemicolons && endsWithSemicolon(line)) || statementEnded {
+			statementEnded = false
+			stmts = append(stmts, buf.String())
+			buf.Reset()
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	// diagnose likely migration script errors
+	if ignoreSemicolons {
+		return nil, fmt.Errorf("WARNING: saw 'StatementBegin' with no matching 'StatementEnd'")
+	}
+
+	if bufferRemaining := strings.TrimSpace(buf.String()); len(bufferRemaining) > 0 {
+		return nil, fmt.Errorf("WARNING: Unexpected unfinished SQL query: %s. Missing a semicolon?\n", bufferRemaining)
+	}
+
+	return stmts, nil
+}
+
 func (ch *ClickHouse) Version() (int, bool, error) {
 	var (
 		version int
